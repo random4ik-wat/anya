@@ -1,8 +1,8 @@
 name: Build Linux (Debian 12 container)
 
 # Build inside a debian:12 container so glibc matches the target server exactly
-# (Debian 12 / glibc 2.36). ubuntu-latest gives glibc 2.39, and a binary built
-# there dies on Debian 12 with "GLIBC_2.38 not found".
+# (Debian 12 / glibc 2.36). ubuntu-latest gives a much newer glibc, and a binary
+# built there dies on Debian 12 with "GLIBC_2.xx not found".
 
 on:
   workflow_dispatch:
@@ -29,28 +29,43 @@ jobs:
 
     steps:
       - name: Install build deps
-        # Must come first: debian:12 ships neither git, python3 nor cmake,
-        # and every later step needs them.
+        # Must be first: debian:12 ships no git/python3/cmake.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl wget gnupg lsb-release git \
-            python3 ca-certificates \
-            build-essential cmake ninja-build pkg-config gperf \
-            zlib1g-dev libssl-dev libcrypt-dev \
-            libcurl4-openssl-dev libglew-dev libdbus-1-dev \
-            libfontconfig-dev libpulse-dev \
+            ca-certificates curl wget gnupg git \
+            python3 build-essential cmake ninja-build pkg-config gperf \
+            zlib1g-dev libssl-dev libcrypt-dev libcurl4-openssl-dev \
+            libglew-dev libdbus-1-dev libfontconfig-dev libpulse-dev \
             libgtk-4-dev libadwaita-1-dev \
-            binutils file
+            binutils file software-properties-common
 
-      - name: Install Clang 22
+      - name: Install Clang >= 20
+        # CMakeLists hard-fails below GCC 15 / Clang 20, and Debian 12 only ships
+        # GCC 12. Add the LLVM apt repo by hand (apt.llvm.org's llvm.sh needs
+        # add-apt-repository and aborts without it), then take the newest
+        # version the distro actually has instead of hard-pinning one.
         run: |
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          /tmp/llvm.sh 22 all
-          echo "CC=clang-22"    >> $GITHUB_ENV
-          echo "CXX=clang++-22" >> $GITHUB_ENV
-          clang-22 --version
+          set -uo pipefail
+          wget -qO /tmp/llvm.key https://apt.llvm.org/llvm-snapshot.gpg.key
+          gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg /tmp/llvm.key
+          for V in 22 21 20; do
+            echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-${V} main" \
+              > /etc/apt/sources.list.d/llvm${V}.list
+          done
+          apt-get update
+          for V in 22 21 20; do
+            if apt-get install -y --no-install-recommends clang-${V} lld-${V}; then
+              echo "PICKED=clang-${V}"
+              echo "CC=clang-${V}"    >> "$GITHUB_ENV"
+              echo "CXX=clang++-${V}" >> "$GITHUB_ENV"
+              break
+            fi
+            echo "clang-${V} unavailable for bookworm, trying older"
+          done
+          grep -E '^C(C|XX)=' "$GITHUB_ENV"
+          "$CXX" --version
+          "$CXX" -dumpversion
 
       - name: Fetch sources
         uses: actions/checkout@v4
@@ -60,9 +75,7 @@ jobs:
         # OpenAI-compatible gateways drop the image in that form and the model
         # replies "I can't see the image". Spec requires {"url": "<data-url>"}:
         #   AJson::Object{{"type","image_url"},{"image_url", body}}
-        # Without this, capabilities.vision is broken end to end.
         run: |
-          set -e
           python3 - <<'PY'
           p = 'src/IOpenAIChat.cpp'
           s = open(p, encoding='utf-8').read()
@@ -92,37 +105,36 @@ jobs:
           cmake -G Ninja -B /work/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DAUI_INSTALL_RUNTIME_DEPENDENCIES=TRUE
+          echo "### cmake cache compiler:"; grep -E 'CMAKE_(CXX_)?COMPILER:' /work/build/CMakeCache.txt
 
       - name: Build kuni
         run: cmake --build /work/build --target kuni -j 4
 
       - name: Stage bundle
         run: |
-          set -e
+          set -eu
           mkdir -p /work/bundle
           cp /work/build/bin/kuni /work/bundle/kuni
           chmod +x /work/bundle/kuni
-
-          # Ship the runtime .so files AUI built/installed, so the binary can run
-          # even if the server lacks a matching distro package.
-          find /work/build -name '*.so*' -type f \
-            ! -path '*/CMakeFiles/*' -exec cp -p {} /work/bundle/ \; 2>/dev/null || true
-
+          find /work/build -name '*.so*' -type f ! -path '*/CMakeFiles/*' \
+            -exec cp -p {} /work/bundle/ \; 2>/dev/null || true
           strip --strip-unneeded /work/bundle/kuni
           strip --strip-unneeded /work/bundle/*.so* 2>/dev/null || true
 
-          # Record what the server will need to apt-get install.
-          ldd /work/bundle/kuni > /work/bundle/ldd.txt 2>&1 || true
-          { echo "### missing (must apt-get install):"; grep -i 'not found' /work/bundle/ldd.txt || echo "(none)"; } >> /work/bundle/ldd.txt
-          echo "### max glibc symbol required:" >> /work/bundle/ldd.txt
-          objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 >> /work/bundle/ldd.txt
-
-          echo "=== bundle ==="
-          ls -la /work/bundle/
-          echo "=== ldd ==="
+          # Record exactly what the server must provide.
+          {
+            echo "### ldd:"
+            ldd /work/bundle/kuni || true
+            echo
+            echo "### MISSING (apt-get install these):"
+            ldd /work/bundle/kuni 2>/dev/null | grep -i 'not found' || echo "(none)"
+            echo
+            echo "### max glibc symbol required:"
+            objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+            echo "### build container glibc:"
+            ldd --version | head -1
+          } > /work/bundle/ldd.txt
           cat /work/bundle/ldd.txt
-          echo "=== glibc of this container ==="
-          ldd --version | head -1
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4
