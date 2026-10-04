@@ -69,10 +69,26 @@ jobs:
             echo "clang-${V} unavailable for bookworm, trying older"
           done
           [ -n "$PICKED" ] || { echo "ERROR: no clang >= 20 available"; exit 1; }
-          # GITHUB_ENV only affects LATER steps, so verify with a local var.
           echo "CC=clang-${PICKED}"    >> "$GITHUB_ENV"
           echo "CXX=clang++-${PICKED}" >> "$GITHUB_ENV"
           echo "PICKED=clang-${PICKED}"
+
+          # tdlib links against the compiler-rt sanitizer runtimes. Without
+          # libclang-rt-XX-dev the driver looks in the upstream triple path
+          # (.../lib/x86_64-pc-linux-gnu/) while Debian ships them in
+          # (.../lib/linux/*-x86_64.a), and ld fails after ~20 min of compiling.
+          for RT in "libclang-rt-${PICKED}-dev" "libclang-common-${PICKED}-dev"; do
+            apt-get install -y --no-install-recommends "$RT" || true
+          done
+          # Prove the runtime actually links - don't just look for a file,
+          # Debian's path/name differ from the upstream one clang defaults to.
+          echo 'int main(){return 0;}' > /tmp/ubsan_probe.cpp
+          if ! clang++-${PICKED} -fsanitize=undefined /tmp/ubsan_probe.cpp -o /tmp/ubsan_probe; then
+            echo "ERROR: -fsanitize=undefined link failed; tdlib would not build"
+            clang++-${PICKED} -print-resource-dir
+            exit 1
+          fi
+          /tmp/ubsan_probe && echo "ubsan link: OK"
           clang++-${PICKED} --version
           clang++-${PICKED} -dumpversion
 
