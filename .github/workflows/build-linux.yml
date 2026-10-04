@@ -60,18 +60,21 @@ jobs:
               > /etc/apt/sources.list.d/llvm${V}.list
           done
           apt-get update
+          PICKED=""
           for V in 22 21 20; do
             if apt-get install -y --no-install-recommends clang-${V} lld-${V}; then
-              echo "PICKED=clang-${V}"
-              echo "CC=clang-${V}"    >> "$GITHUB_ENV"
-              echo "CXX=clang++-${V}" >> "$GITHUB_ENV"
+              PICKED="$V"
               break
             fi
             echo "clang-${V} unavailable for bookworm, trying older"
           done
-          grep -E '^C(C|XX)=' "$GITHUB_ENV"
-          "$CXX" --version
-          "$CXX" -dumpversion
+          [ -n "$PICKED" ] || { echo "ERROR: no clang >= 20 available"; exit 1; }
+          # GITHUB_ENV only affects LATER steps, so verify with a local var.
+          echo "CC=clang-${PICKED}"    >> "$GITHUB_ENV"
+          echo "CXX=clang++-${PICKED}" >> "$GITHUB_ENV"
+          echo "PICKED=clang-${PICKED}"
+          clang++-${PICKED} --version
+          clang++-${PICKED} -dumpversion
 
       - name: Fetch sources
         uses: actions/checkout@v4
