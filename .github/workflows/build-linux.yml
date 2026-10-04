@@ -127,13 +127,21 @@ jobs:
 
       - name: Configure CMake
         run: |
+          echo "### disk before configure:"; df -h / | tail -1
           cmake -G Ninja -B /work/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DAUI_INSTALL_RUNTIME_DEPENDENCIES=TRUE
+            -DAUI_INSTALL_RUNTIME_DEPENDENCIES=TRUE \
+            -DAUIB_NO_PRECOMPILED=TRUE
           echo "### cmake cache compiler:"; grep -E 'CMAKE_(CXX_)?COMPILER:' /work/build/CMakeCache.txt
+          echo "### AUIB_NO_PRECOMPILED (forces every dep to build from source here):"
+          grep -E 'AUIB_NO_PRECOMPILED' /work/build/CMakeCache.txt
+          echo "### disk after configure:"; df -h / | tail -1
 
       - name: Build kuni
-        run: cmake --build /work/build --target kuni -j 4
+        run: |
+          echo "### disk before build:"; df -h / | tail -1
+          cmake --build /work/build --target kuni -j 4
+          echo "### disk after build:"; df -h / | tail -1
 
       - name: Stage bundle
         run: |
@@ -145,6 +153,22 @@ jobs:
             -exec cp -p {} /work/bundle/ \; 2>/dev/null || true
           strip --strip-unneeded /work/bundle/kuni
           strip --strip-unneeded /work/bundle/*.so* 2>/dev/null || true
+
+          # Hard gate: the server is Debian 12, whose newest symbol version is
+          # GLIBC_2.36 (2.36-9+deb12u14 exposes no 2.36.x). AUI.BOOT's
+          # precompiled packages come from ubuntu-latest (glibc 2.39), so one
+          # stray precompiled .a would silently raise our floor to 2.38+.
+          # Compare major.minor only - a patch-level suffix must not false-trigger.
+          MAXGLIBC=$(objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1 || true)
+          VER=${MAXGLIBC#GLIBC_}
+          MM=$(printf '%s' "$VER" | cut -d. -f1,2)
+          HIGHEST=$(printf '%s\n%s\n' "${MM:-none}" 2.36 | sort -V | tail -1)
+          echo "### binary needs ${MM:-?} (max symbol $MAXGLIBC); server floor is 2.36"
+          if [ "$HIGHEST" != "2.36" ]; then
+            echo "ERROR: kuni needs glibc ${MM}, newer than Debian 12 (2.36) - it would not start on the server"
+            exit 1
+          fi
+          echo "### glibc gate: OK (fits Debian 12)"
 
           # Record exactly what the server must provide.
           {
