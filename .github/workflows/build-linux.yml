@@ -142,6 +142,89 @@ jobs:
           PY
           grep -n 'TDLib error' -B3 src/telegram/TelegramClientImpl.cpp
 
+      - name: "Patch: auth diagnostics + config reload safety"
+        # Diagnosis 2026-10-05: after setAuthenticationPhoneNumber neither the
+        # query response (Ok/error) nor updateAuthorizationState(WaitCode) ever
+        # surfaces - not even getOption("version") logs its reply. Log every
+        # query response and every auth-state update at INFO so the stall point
+        # becomes visible. Also: Kuni rewrites config.toml at startup while its
+        # own FileWatcher may reload the truncated file -> api_id reads as 0 ->
+        # std::exit(-1) kills the process. Reloads must throw (caught, previous
+        # config kept) instead of exiting.
+        run: |
+          set -e
+          python3 - <<'PY'
+          # 1) log every outgoing query (id + payload, truncated)
+          p = 'src/telegram/TelegramClientImpl.cpp'
+          s = open(p, encoding='utf-8').read()
+          a = '    ALOG_TRACE(LOG_TAG) << "sendQuery " << td::td_api::to_string(f);\n'
+          b = a + '    ALogger::info(LOG_TAG) << "sendQuery #" << (mCurrentQueryId + 1) << ": " << td::td_api::to_string(f).substr(0, 300);\n'
+          if 'sendQuery #" <<' in s:
+              print('diag sendQuery: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('diag sendQuery: patched OK')
+          else:
+              print('ERROR: sendQuery anchor not found'); raise SystemExit(1)
+          # 2) log every query response + every auth-state update
+          a = '    if (auto c = mHandlers.contains(response.request_id)) {\n'
+          b = ('    if (response.request_id != 0) {\n'
+               '        ALogger::info(LOG_TAG) << "query response id=" << response.request_id << ": " << td::td_api::to_string(response.object).substr(0, 400);\n'
+               '    } else if (response.object->get_id() == td::td_api::updateAuthorizationState::ID) {\n'
+               '        ALogger::info(LOG_TAG) << "auth update: " << td::td_api::to_string(response.object).substr(0, 400);\n'
+               '    }\n' + a)
+          if 'query response id=' in s:
+              print('diag responses: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('diag responses: patched OK')
+          else:
+              print('ERROR: processResponse anchor not found'); raise SystemExit(1)
+          # 3) prove stdin read works (length only, no secret in logs)
+          a = '                        std::cin >> params->phone_number_;\n'
+          b = a + '                        ALogger::info(LOG_TAG) << "phone entered, length=" << params->phone_number_.length();\n'
+          if 'phone entered, length=' in s:
+              print('diag phone: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('diag phone: patched OK')
+          else:
+              print('ERROR: phone anchor not found'); raise SystemExit(1)
+          open(p, 'w', encoding='utf-8').write(s)
+          # 4) config reload must not kill the process on a torn read
+          p = 'src/config.cpp'
+          s = open(p, encoding='utf-8').read()
+          a = 'static Config load(bool saveBack = false) {'
+          b = 'static Config load(bool saveBack = false, bool isReload = false) {'
+          if 'bool isReload' in s:
+              print('config sig: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('config sig: patched OK')
+          else:
+              print('ERROR: load() signature not found'); raise SystemExit(1)
+          a = '                cfg = load();'
+          b = '                cfg = load(false, true);'
+          if b in s:
+              print('config watcher: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('config watcher: patched OK')
+          else:
+              print('ERROR: watcher call not found'); raise SystemExit(1)
+          a = '                std::exit(-1);'
+          n = s.count(a)
+          if 'keeping previous config' in s:
+              print('config validation: already patched')
+          elif n == 3:
+              s = s.replace(a, '                if (isReload) { throw AException("config reload read inconsistent data - keeping previous config"); } std::exit(-1);')
+              print('config validation: patched OK (3 sites)')
+          else:
+              print(f'ERROR: expected 3 validation exits, found {n}'); raise SystemExit(1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -n 'sendQuery #\|query response id=\|auth update:\|phone entered\|isReload\|keeping previous config' src/telegram/TelegramClientImpl.cpp src/config.cpp
+
       - name: "Patch: forward build-time flags to AUI.BOOT deps"
         # AUI.BOOT configures every dependency in a SEPARATE `cmake` process
         # (execute_process), which does NOT inherit our CMake cache. Only the
@@ -196,7 +279,7 @@ jobs:
       - name: Build kuni
         run: |
           echo "### disk before build:"; df -h / | tail -1
-          cmake --build /work/build --target kuni -j 6
+          cmake --build /work/build --target kuni -j 4
           echo "### disk after build:"; df -h / | tail -1
 
       - name: Stage bundle
