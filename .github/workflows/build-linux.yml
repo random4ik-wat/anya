@@ -95,12 +95,14 @@ jobs:
       - name: Fetch sources
         uses: actions/checkout@v4
 
-      - name: Patch image_url to OpenAI spec
+      - name: "Patch: image_url to OpenAI spec"
         # Kuni emits {"type":"image_url","image_url":"<data-url>"} - a bare string.
         # OpenAI-compatible gateways drop the image in that form and the model
         # replies "I can't see the image". Spec requires {"url": "<data-url>"}:
         #   AJson::Object{{"type","image_url"},{"image_url", body}}
+        # Without this, capabilities.vision is broken end to end.
         run: |
+          set -e
           python3 - <<'PY'
           p = 'src/IOpenAIChat.cpp'
           s = open(p, encoding='utf-8').read()
@@ -116,6 +118,60 @@ jobs:
               raise SystemExit(1)
           PY
           grep -n 'image_url' src/IOpenAIChat.cpp
+
+      - name: "Patch: log TDLib errors"
+        # Kuni discards every td_api::error, so an auth failure produces no log
+        # line at all and is impossible to diagnose. Surface them.
+        # NOTE: patterns use \n escapes on purpose - literal indentation would
+        # be stripped by the YAML block scalar and never match.
+        run: |
+          set -e
+          python3 - <<'PY'
+          p = 'src/telegram/TelegramClientImpl.cpp'
+          s = open(p, encoding='utf-8').read()
+          old = '    ALOG_TRACE(LOG_TAG) << "processResponse";\n    if (!response.object) {\n        return;\n    }\n'
+          new = old + '    if (auto e = dynamic_cast<td::td_api::error*>(response.object.get())) {\n        ALogger::err(LOG_TAG) << "TDLib error " << e->code_ << ": " << e->message_;\n    }\n'
+          if 'TDLib error' in s:
+              print('already patched')
+          elif old in s:
+              open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+              print('patched OK')
+          else:
+              print('ERROR: processResponse pattern not found')
+              raise SystemExit(1)
+          PY
+          grep -n 'TDLib error' -B3 src/telegram/TelegramClientImpl.cpp
+
+      - name: "Patch: forward build-time flags to AUI.BOOT deps"
+        # AUI.BOOT configures every dependency in a SEPARATE `cmake` process
+        # (execute_process), which does NOT inherit our CMake cache. Only the
+        # variables listed in aui.boot.cmake - or explicitly marked with
+        # auib_mark_var_forwardable - are passed down. Without this, passing
+        # -DBUILD_TESTING=OFF / -DTD_INSTALL_SHARED_LIBRARIES=OFF to our own
+        # configure is silently dropped and tdlib still builds its ~15 test
+        # executables plus libtdjson.so (~30 MB).
+        run: |
+          set -e
+          python3 - <<'PY'
+          p = 'CMakeLists.txt'
+          s = open(p, encoding='utf-8').read()
+          anchor = 'set(AUIB_TD_VALIDATE OFF)'
+          inject = ('# --- build-time optimization (added during setup) ---\n'
+                    'set(BUILD_TESTING OFF)\n'
+                    'auib_mark_var_forwardable(BUILD_TESTING)\n'
+                    'set(TD_INSTALL_SHARED_LIBRARIES OFF)\n'
+                    'auib_mark_var_forwardable(TD_INSTALL_SHARED_LIBRARIES)\n'
+                    '# --- end build-time optimization ---\n\n')
+          if 'build-time optimization' in s:
+              print('already patched')
+          elif anchor in s:
+              open(p, 'w', encoding='utf-8').write(s.replace(anchor, inject + anchor, 1))
+              print('patched OK')
+          else:
+              print('ERROR: anchor not found')
+              raise SystemExit(1)
+          PY
+          grep -n -A5 'build-time optimization' CMakeLists.txt
 
       - name: Cache AUI.BOOT deps
         uses: actions/cache@v4
@@ -140,10 +196,13 @@ jobs:
       - name: Build kuni
         run: |
           echo "### disk before build:"; df -h / | tail -1
-          cmake --build /work/build --target kuni -j 4
+          cmake --build /work/build --target kuni -j 6
           echo "### disk after build:"; df -h / | tail -1
 
       - name: Stage bundle
+        # NOTE: no `set -e` here. The ldd/glibc probes below are diagnostics;
+        # one flaky pipe must not abort the step. The glibc gate still exits 1
+        # explicitly when the binary would not fit Debian 12.
         run: |
           set -u
           mkdir -p /work/bundle
@@ -155,19 +214,22 @@ jobs:
           strip --strip-unneeded /work/bundle/*.so* 2>/dev/null || true
 
           # Hard gate: the server is Debian 12, whose newest symbol version is
-          # GLIBC_2.36. AUI.BOOT precompiled packages come from ubuntu-latest
-          # (glibc 2.39), so a stray precompiled .a would raise our floor.
+          # GLIBC_2.36 (2.36-9+deb12u14 exposes no 2.36.x). AUI.BOOT's
+          # precompiled packages come from ubuntu-latest (glibc 2.39), so one
+          # stray precompiled .a would silently raise our floor to 2.38+.
+          # Compare major.minor only - a patch-level suffix must not false-trigger.
           MAXGLIBC=$(objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1 || true)
           VER=${MAXGLIBC#GLIBC_}
           MM=$(printf '%s' "$VER" | cut -d. -f1,2)
           HIGHEST=$(printf '%s\n%s\n' "${MM:-none}" 2.36 | sort -V | tail -1)
           echo "### binary needs ${MM:-?} (max symbol $MAXGLIBC); server floor is 2.36"
           if [ "$HIGHEST" != "2.36" ]; then
-            echo "ERROR: kuni needs glibc ${MM}, newer than Debian 12 (2.36)"
+            echo "ERROR: kuni needs glibc ${MM}, newer than Debian 12 (2.36) - it would not start on the server"
             exit 1
           fi
           echo "### glibc gate: OK (fits Debian 12)"
 
+          # Record exactly what the server must provide.
           {
             echo "### ldd:"
             ldd /work/bundle/kuni 2>/dev/null || true
@@ -175,7 +237,7 @@ jobs:
             echo "### MISSING (apt-get install these):"
             ldd /work/bundle/kuni 2>/dev/null | grep -i 'not found' || echo "(none)"
             echo
-            echo "### max glibc symbol:"
+            echo "### max glibc symbol required:"
             objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 || true
             echo "### build container glibc:"
             ldd --version 2>/dev/null | sed -n '1p'
