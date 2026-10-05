@@ -248,6 +248,64 @@ jobs:
           PY
           grep -n 'setLogVerbosityLevel' src/telegram/TelegramClientImpl.cpp
 
+      - name: "Patch: auth teardown telemetry + getline input"
+        # Diagnosis 2026-10-05: run #11 proved sendCode reaches the wire (code arrived
+        # in app), but the app destroys its ClientManager ~0.4s after phone input with
+        # no shutdown sequence, no reload, no Closed-before-destroy (event table:
+        # Tdlib version=0, reload=0, shutdown=0, Created=1/Destroy=1). Add destructor
+        # + init logs to identify the destroyer. Also switch stdin reads to getline
+        # so no trailing newline stays in the buffer for anyone else to consume.
+        run: |
+          set -e
+          python3 - <<'PY'
+          h = 'src/telegram/TelegramClientImpl.h'
+          s = open(h, encoding='utf-8').read()
+          a = '    TelegramClientImpl();\n'
+          b = a + '    ~TelegramClientImpl();\n'
+          if '~TelegramClientImpl();' in s:
+              print('hdr dtor: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              open(h, 'w', encoding='utf-8').write(s)
+              print('hdr dtor: patched OK')
+          else:
+              print('ERROR: ctor anchor not found'); raise SystemExit(1)
+          p = 'src/telegram/TelegramClientImpl.cpp'
+          s = open(p, encoding='utf-8').read()
+          a = 'AFuture<ITelegramClient::Object> TelegramClientImpl::sendQuery'
+          b = ('TelegramClientImpl::~TelegramClientImpl() {\n'
+               '    ALogger::info(LOG_TAG) << "~TelegramClientImpl destroyed";\n'
+               '}\n\n' + a)
+          if '~TelegramClientImpl destroyed' in s:
+              print('dtor log: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('dtor log: patched OK')
+          else:
+              print('ERROR: sendQuery anchor not found'); raise SystemExit(1)
+          a = '    ALOG_TRACE(LOG_TAG) << "initClientManager";\n'
+          b = a + '    ALogger::info(LOG_TAG) << "initClientManager: (re)creating ClientManager";\n'
+          if 'initClientManager: (re)creating' in s:
+              print('init log: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('init log: patched OK')
+          else:
+              print('ERROR: init anchor not found'); raise SystemExit(1)
+          for field in ['phone_number_', 'password_', 'code_']:
+              a = 'std::cin >> params->%s;' % field
+              b = 'std::getline(std::cin, params->%s);' % field
+              if b in s:
+                  print('getline %s: already patched' % field)
+              elif a in s:
+                  s = s.replace(a, b)
+                  print('getline %s: patched OK' % field)
+              else:
+                  print('ERROR: cin anchor not found for %s' % field); raise SystemExit(1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+          grep -n '~TelegramClientImpl\|(re)creating\|std::getline' src/telegram/TelegramClientImpl.h src/telegram/TelegramClientImpl.cpp
+
       - name: "Patch: forward build-time flags to AUI.BOOT deps"
         # AUI.BOOT configures every dependency in a SEPARATE `cmake` process
         # (execute_process), which does NOT inherit our CMake cache. Only the
