@@ -320,7 +320,7 @@ jobs:
           s = open(p, encoding='utf-8').read()
           a = '    _<App> app;\n'
           b = ('    _<App> app;\n'
-               '    _<ITelegramClient> telegram; // outlives aui_entry: block-local holder died at } and killed auth right after connect\n')
+               '    _<TelegramClientImpl> telegram; // outlives aui_entry: block-local holder died at } and killed auth right after connect\n')
           if 'outlives aui_entry' in s:
               print('hoist decl: already patched')
           elif a in s:
