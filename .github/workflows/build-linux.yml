@@ -306,6 +306,41 @@ jobs:
           PY
           grep -n '~TelegramClientImpl\|(re)creating\|std::getline' src/telegram/TelegramClientImpl.h src/telegram/TelegramClientImpl.cpp
 
+      - name: "Patch: keep TelegramClient alive (block-scope lifetime bug)"
+        # Root cause 2026-10-05: in main.cpp, `auto telegram` is declared INSIDE
+        # `if (config().telegramEnabled) { ... }`. The holder dies at the closing
+        # brace; afterwards the ONLY owner is the suspended connect-lambda's capture.
+        # The moment the connection is established the lambda completes, the last
+        # holder drops, ~TelegramClientImpl runs and tears down TDLib ~0.4s after
+        # phone input - every time. Fix: hoist the holder to aui_entry scope.
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          p = 'src/main.cpp'
+          s = open(p, encoding='utf-8').read()
+          a = '    _<App> app;\n'
+          b = ('    _<App> app;\n'
+               '    _<ITelegramClient> telegram; // outlives aui_entry: block-local holder died at } and killed auth right after connect\n')
+          if 'outlives aui_entry' in s:
+              print('hoist decl: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('hoist decl: patched OK')
+          else:
+              print('ERROR: decl anchor not found'); raise SystemExit(1)
+          a = '        auto telegram = _new<TelegramClientImpl>();'
+          b = '        telegram = _new<TelegramClientImpl>();'
+          if b in s:
+              print('hoist assign: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('hoist assign: patched OK')
+          else:
+              print('ERROR: assign anchor not found'); raise SystemExit(1)
+          open(p, 'w', encoding='utf-8').write(s)
+          PYEOF
+          grep -n 'outlives aui_entry\|telegram = _new' src/main.cpp
+
       - name: "Patch: forward build-time flags to AUI.BOOT deps"
         # AUI.BOOT configures every dependency in a SEPARATE `cmake` process
         # (execute_process), which does NOT inherit our CMake cache. Only the
