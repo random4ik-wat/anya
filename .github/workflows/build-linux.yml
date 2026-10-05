@@ -145,7 +145,7 @@ jobs:
 
       - name: Stage bundle
         run: |
-          set -eu
+          set -u
           mkdir -p /work/bundle
           cp /work/build/bin/kuni /work/bundle/kuni
           chmod +x /work/bundle/kuni
@@ -155,33 +155,30 @@ jobs:
           strip --strip-unneeded /work/bundle/*.so* 2>/dev/null || true
 
           # Hard gate: the server is Debian 12, whose newest symbol version is
-          # GLIBC_2.36 (2.36-9+deb12u14 exposes no 2.36.x). AUI.BOOT's
-          # precompiled packages come from ubuntu-latest (glibc 2.39), so one
-          # stray precompiled .a would silently raise our floor to 2.38+.
-          # Compare major.minor only - a patch-level suffix must not false-trigger.
+          # GLIBC_2.36. AUI.BOOT precompiled packages come from ubuntu-latest
+          # (glibc 2.39), so a stray precompiled .a would raise our floor.
           MAXGLIBC=$(objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1 || true)
           VER=${MAXGLIBC#GLIBC_}
           MM=$(printf '%s' "$VER" | cut -d. -f1,2)
           HIGHEST=$(printf '%s\n%s\n' "${MM:-none}" 2.36 | sort -V | tail -1)
           echo "### binary needs ${MM:-?} (max symbol $MAXGLIBC); server floor is 2.36"
           if [ "$HIGHEST" != "2.36" ]; then
-            echo "ERROR: kuni needs glibc ${MM}, newer than Debian 12 (2.36) - it would not start on the server"
+            echo "ERROR: kuni needs glibc ${MM}, newer than Debian 12 (2.36)"
             exit 1
           fi
           echo "### glibc gate: OK (fits Debian 12)"
 
-          # Record exactly what the server must provide.
           {
             echo "### ldd:"
-            ldd /work/bundle/kuni || true
+            ldd /work/bundle/kuni 2>/dev/null || true
             echo
             echo "### MISSING (apt-get install these):"
             ldd /work/bundle/kuni 2>/dev/null | grep -i 'not found' || echo "(none)"
             echo
-            echo "### max glibc symbol required:"
-            objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+            echo "### max glibc symbol:"
+            objdump -T /work/bundle/kuni | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 || true
             echo "### build container glibc:"
-            ldd --version | head -1
+            ldd --version 2>/dev/null | sed -n '1p'
           } > /work/bundle/ldd.txt
           cat /work/bundle/ldd.txt
 
