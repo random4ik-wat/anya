@@ -225,6 +225,29 @@ jobs:
           PY
           grep -n 'sendQuery #\|query response id=\|auth update:\|phone entered\|isReload\|keeping previous config' src/telegram/TelegramClientImpl.cpp src/config.cpp
 
+      - name: "Patch: TDLib log verbosity"
+        # Diagnosis 2026-10-05: server never answers TDLib's auth.sendCode and the
+        # connection then vanishes without TDLib noticing (process alive, zero
+        # sockets, frozen log). Kuni-side logging is exhausted - need TDLib's own
+        # network/query log (connection events, query send/receive, drops).
+        run: |
+          set -e
+          python3 - <<'PY'
+          p = 'src/telegram/TelegramClientImpl.cpp'
+          s = open(p, encoding='utf-8').read()
+          a = 'td::ClientManager::execute(td::td_api::make_object<td::td_api::setLogVerbosityLevel>(1));'
+          b = 'td::ClientManager::execute(td::td_api::make_object<td::td_api::setLogVerbosityLevel>(4));'
+          if 'setLogVerbosityLevel>(4)' in s:
+              print('verbosity: already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              open(p, 'w', encoding='utf-8').write(s)
+              print('verbosity: patched OK (1 -> 4)')
+          else:
+              print('ERROR: verbosity anchor not found'); raise SystemExit(1)
+          PY
+          grep -n 'setLogVerbosityLevel' src/telegram/TelegramClientImpl.cpp
+
       - name: "Patch: forward build-time flags to AUI.BOOT deps"
         # AUI.BOOT configures every dependency in a SEPARATE `cmake` process
         # (execute_process), which does NOT inherit our CMake cache. Only the
