@@ -377,12 +377,23 @@ jobs:
           python3 - <<'PYEOF'
           p = 'src/main.cpp'
           s = open(p, encoding='utf-8').read()
-          # 1) polling timer in App constructor, right after onEvent wiring
+          # 1) polling timer in App constructor, right after onEvent wiring.
+          # Guarded against overlapping scans (a previous scan may still be in
+          # flight when the next tick fires - concurrent getChats/chat walks
+          # segfaulted once).
           a = '                mAsync << this->handleTelegramEvent(aui::ptr::alias(event, u));\n            });\n        });\n'
           b = (a + '        // Polling fallback: direct-message wakeups are flaky (see above).\n'
                   '        mPollTimer = _new<ATimer>(3min);\n'
                   '        connect(mPollTimer->fired, [this] {\n'
-                  '            mAsync << this->sendNotificationsOnInit();\n'
+                  '            mAsync << [this]() -> AFuture<> {\n'
+                  '                static bool scanInFlight = false;\n'
+                  '                if (scanInFlight) {\n'
+                  '                    co_return;\n'
+                  '                }\n'
+                  '                scanInFlight = true;\n'
+                  '                AUI_DEFER { scanInFlight = false; };\n'
+                  '                co_await sendNotificationsOnInit();\n'
+                  '            }();\n'
                   '        });\n'
                   '        mPollTimer->start();\n')
           if 'mPollTimer' in s:
