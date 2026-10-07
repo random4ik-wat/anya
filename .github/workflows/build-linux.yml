@@ -536,8 +536,12 @@ jobs:
           chmod +x /work/bundle/kuni
           find /work/build -name '*.so*' -type f ! -path '*/CMakeFiles/*' \
             -exec cp -p {} /work/bundle/ \; 2>/dev/null || true
-          strip --strip-unneeded /work/bundle/kuni
-          strip --strip-unneeded /work/bundle/*.so* 2>/dev/null || true
+          # NOTE (2026-10-07): do NOT strip this binary. An unstripped RelWithDebInfo
+          # build is required so the next segfault yields a symbolicated backtrace
+          # via gdb attach (the app's own SignalHandler swallows SIGSEGV with
+          # exit(255), so no coredump is ever written; and a stripped binary
+          # would only print ?? frames). Yes, the artifact is bigger - that's fine.
+          echo "### unstripped binary size:"; du -h /work/bundle/kuni
 
           # Hard gate: the server is Debian 12, whose newest symbol version is
           # GLIBC_2.36 (2.36-9+deb12u14 exposes no 2.36.x). AUI.BOOT's
