@@ -425,6 +425,35 @@ jobs:
               print('poll skip: patched OK')
           else:
               print('ERROR: sendNotificationsOnInit anchor not found'); raise SystemExit(1)
+          # 3b) NEVER synthesize from a null last_message_ (this segfaulted twice:
+          # handleTelegramEvent dereferences message_->sender_id_ at line 338)
+          a = ('            auto notification = _new<td::td_api::updateNewMessage>();\n'
+               '            notification->message_ = std::move(chat->last_message_);\n')
+          b = ('            if (!chat->last_message_) {\n'
+               '                ALogger::info(LOG_TAG) << "scan: chat " << chat->id_ << " has null last_message, skipping";\n'
+               '                continue;\n'
+               '            }\n' + a)
+          if 'has null last_message, skipping' in s:
+              print('null guard(scan): already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('null guard(scan): patched OK')
+          else:
+              print('ERROR: scan synthesize anchor not found'); raise SystemExit(1)
+          # 3c) belt and braces: never dereference a null message/sender
+          a = ('    AFuture<> handleTelegramEvent(AArc<const td::td_api::updateNewMessage> u) {\n'
+               '        int64_t userId = 0;\n')
+          b = (a + '        if (!u->message_ || !u->message_->sender_id_) {\n'
+                  '            ALogger::info(LOG_TAG) << "updateNewMessage with null message/sender, ignoring";\n'
+                  '            co_return;\n'
+                  '        }\n')
+          if 'with null message/sender, ignoring' in s:
+              print('null guard(handler): already patched')
+          elif a in s:
+              s = s.replace(a, b, 1)
+              print('null guard(handler): patched OK')
+          else:
+              print('ERROR: handler entry anchor not found'); raise SystemExit(1)
           # 4) log every incoming message + filter drops (end silent discards)
           a = '            userId = user->user_id_;\n        }\n'
           b = (a + '        ALogger::info(LOG_TAG) << "updateNewMessage: chat=" << u->message_->chat_id_ << " sender=" << userId;\n')
